@@ -1,0 +1,466 @@
+AWSTemplateFormatVersion: 2010-09-09
+# Configuration parameters which will be used while creating resource
+
+Parameters:
+  MyBucketName:
+    Description: S3 Bucket name
+    Type: String
+    Default: expense-receipts-s3bucket
+
+Resources:
+  # DynamoDB Table
+  ExpenseTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ExpenseTableFormation
+      AttributeDefinitions:
+        - AttributeName: timeStamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: timeStamp
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 15
+        WriteCapacityUnits: 15
+
+  # Lambda Function (ReceiptExtractor)
+  ReceiptExtractorFunctionFormation:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ReceiptExtractorFormation
+      Runtime: nodejs16.x
+      Handler: index.handler
+      Timeout: 30
+      Role: arn:aws:iam::430910936224:role/LabRole
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const textract = new AWS.Textract();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const s3 = new AWS.S3();
+
+          exports.handler = async (event) => {
+            // Get the S3 bucket and object information from the event
+            console.log(event);
+            console.log("Execution Started");
+            const bucket = event.Records[0].s3.bucket.name;
+            const key = event.Records[0].s3.object.key;
+
+            // Set up AWS Textract parameters
+            const params = {
+              Document: {
+                S3Object: {
+                  Bucket: bucket,
+                  Name: key,
+                },
+              },
+            };
+
+            const downloadUrl = await s3.getSignedUrlPromise('getObject', {
+              Bucket: bucket,
+              Key: key,
+              Expires: 60480,
+            });
+
+            try {
+              // Call AWS Textract to analyze the expense document
+              const data = await textract.analyzeExpense(params).promise();
+              console.log(data);
+
+              // Log the arrays
+              console.log('Summary Fields:', data.ExpenseDocuments[0].SummaryFields);
+              const summaryFields = data.ExpenseDocuments[0]?.SummaryFields || [];
+
+              const extractField = (fieldName) => summaryFields.find(field => field.Type.Text === fieldName)?.ValueDetection?.Text;
+              let vendorName = extractField('VENDOR_NAME');
+              let vendorAddress = extractField('VENDOR_ADDRESS');
+              let roundedTotal = extractField('TOTAL') ?? extractField('TOTAL' && 'ROUNDED TOTAL:');
+              let invoiceReceiptDate = extractField('INVOICE_RECEIPT_DATE');
+
+              // Log the extracted values
+              console.log('VENDOR_NAME:', vendorName);
+              console.log('VENDOR_ADDRESS:', vendorAddress);
+              console.log('Rounded Total:', roundedTotal);
+              console.log('Invoice Receipt Date:', invoiceReceiptDate);
+
+              // Check if any of the variables are undefined and set them to default values
+              if (vendorName === undefined || vendorName === "") {
+                vendorName = "NAN";
+              }
+              if (vendorAddress === undefined || vendorAddress === "") {
+                vendorAddress = "NAN";
+              }
+              if (roundedTotal === undefined || roundedTotal === "") {
+                roundedTotal = "NAN";
+              }
+              if (invoiceReceiptDate === undefined || invoiceReceiptDate === "") {
+                invoiceReceiptDate = "NAN";
+              }
+
+              // Call the putInDatabase function with the extracted or default values
+              await putInDatabase(vendorName, vendorAddress, roundedTotal, invoiceReceiptDate, downloadUrl);
+              console.log("Updated!");
+
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ expense: "Too much problems" }),
+              };
+            } catch (error) {
+              console.error('Error:', error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: 'Error processing the expense document with Textract' }),
+              };
+            }
+          };
+
+          async function putInDatabase(vendorName, vendorAddress, roundedTotal, invoiceReceiptDate, downloadUrl) {
+            console.log("Passed to Function");
+            console.log(vendorName);
+            console.log(vendorAddress);
+            console.log(roundedTotal);
+            console.log(invoiceReceiptDate);
+
+            const item = {
+              timeStamp: new Date().toISOString(),
+              VendorName: vendorName,
+              VendorAddress: vendorAddress,
+              RoundedTotal: roundedTotal,
+              InvoiceReceiptDate: invoiceReceiptDate,
+              DownloadURL: downloadUrl,
+            };
+
+            const dbParams = {
+              TableName: 'ExpenseTableFormation',
+              Item: item,
+            };
+
+            await dynamodb.put(dbParams).promise();
+          }
+    # Trigger S3
+  ReceiptExtractorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ReceiptExtractorFunctionFormation
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${MyBucketName}"
+      SourceAccount: !Ref AWS::AccountId
+
+  # S3
+  ExpenseReceiptsS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref MyBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ReceiptExtractorFunctionFormation.Arn
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - PUT
+              - POST
+              - DELETE
+              - GET
+            AllowedOrigins:
+              - "*"
+    
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub 'arn:aws:s3:::${MyBucketName}/*'
+      Bucket: !Ref ExpenseReceiptsS3Bucket
+
+
+  # Lambda Function (ExtractExpenseDB)
+  ExtractExpenseDB:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: retrieveExpenseDBFormation
+      Runtime: nodejs16.x
+      Handler: index.handler
+      Timeout: 30
+      Role: arn:aws:iam::430910936224:role/LabRole
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event) => {
+            try {
+              const params = {
+                TableName: 'ExpenseTableFormation',
+              };
+
+              const data = await dynamodb.scan(params).promise();
+
+              return {
+                statusCode: 200,
+                headers: {
+                'Content-Type': 'application/json', 
+                'Access-Control-Allow-Origin': '*',
+                },
+                body: JSON.stringify(data.Items),
+              };
+            } catch (error) {
+              console.error('Error:', error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: 'Error fetching data from the "Expenses" table' }),
+              };
+            }
+          };
+
+  # API Gateway
+
+  # Step-1: API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ExpenseAPIFormation
+
+   # Step-2: Lambda Permission for API Gateway
+  ExtractExpenseDBPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !GetAtt ExtractExpenseDB.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*"
+
+  # Step-3: API Gateway Resource
+  ExpenseResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "expenseformation"
+
+  # Step-4: API Gateway Method for GET
+  ExpenseGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ExpenseResource
+      AuthorizationType: NONE
+      HttpMethod: GET
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ExtractExpenseDB.Arn}/invocations"
+        IntegrationResponses: 
+          - StatusCode: 200
+            ResponseTemplates:
+              "application/json": $input.json('$')
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        RequestTemplates:
+          "application/json": $input.json('$')
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Headers": true
+            "method.response.header.Access-Control-Allow-Methods": true
+            "method.response.header.Access-Control-Allow-Origin": true
+
+  # Step-5 API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ExpenseGetMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  # Step-6: API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties: 
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      Description: Production Stage
+
+  # Lambda Function (TriggerExpense)
+  TriggerExpense:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TriggerExpenseFormation
+      Runtime: nodejs16.x
+      Handler: index.handler
+      Timeout: 30
+      Role: arn:aws:iam::430910936224:role/LabRole
+      Environment: 
+        Variables: 
+          SNS_TOPIC_ARN: !Ref SNSTopic
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const sns = new AWS.SNS();
+
+          exports.handler = async (event) => {
+          try {
+            const params = {
+              TableName: 'ExpenseTableFormation',
+            };
+            const data = await dynamodb.scan(params).promise();
+            let total = 0; 
+
+            data.Items.forEach((item) => {
+              total += Number(item.RoundedTotal); 
+            });
+
+            const message = `Total monthly expenses: $${total}`;
+            const topicArn = process.env.SNS_TOPIC_ARN; 
+
+            const snsParams = {
+              Message: message,
+              TopicArn: topicArn,
+            };
+
+            await sns.publish(snsParams).promise();
+
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ message: 'Message sent successfully' }),
+            };
+          } catch (error) {
+            console.error('Error:', error);
+            return {
+              statusCode: 500,
+              body: JSON.stringify({ message: 'Error processing expenses or sending message' }),
+            };
+          }
+          };
+
+  # SNS Topic
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: SendEmailFormation
+
+  # SNS Subscription
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SNSTopic
+      Protocol: email
+      Endpoint: sarthak3136@gmail.com
+
+  # Lambda Permission for SNS
+  LambdaPermissionForSNS:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerExpense
+      Action: lambda:invokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SNSTopic
+
+  # EventBridge Schedule
+  MyEventRule:
+    Type: 'AWS::Scheduler::Schedule'
+    Properties:
+      Description: WeeklyExpense
+      Name: WeeklyExpenseFormation
+      FlexibleTimeWindow:
+        Mode: FLEXIBLE
+        MaximumWindowInMinutes: 5
+      ScheduleExpression: rate(5 minutes)
+      ScheduleExpressionTimezone: America/Halifax
+      State: ENABLED
+      Target:
+        Arn: !GetAtt  TriggerExpense.Arn
+        RoleArn: arn:aws:iam::430910936224:role/LabRole
+
+
+  # EC2
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.medium
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+      KeyName: ec2-key-formation
+      ImageId: ami-0f34c5ae932e6f0e4
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          sudo su
+          yum install -y aws-cli
+          yum -y install nodejs
+          
+          aws configure set aws_access_key_id ASIAWIVCLCSQFJ67VUHH
+          aws configure set aws_secret_access_key wL+AWjYuDKu34+FBb5b+pb2rWPZ+dTPj490ooBIr
+          aws configure set aws_session_token FwoGZXIvYXdzEFkaDKiJ1xEIWf88S77BZiLAAUxFHmhZpxxLyxWVtnaOYOOlDyQov8vSuloYrCTY4RO0wCbrv5jwIMuHctZFWdSlbtkmNEUZ2Fg0bfU4cwSyZ5/vdXTxQmHIs4vaCJFkiJXfv72cXijAbEEVuQMfCQ7iqOfmYpecEIeF7AfsU339O2AkpNQzwxLqQnGvbbfLXYBLiL+bjMOu01vA58G3uMHu4JSGRDyEeMykKoEsNk6GhH6c1h3v7PZiAPB3DHMTPPEjcAJObWE8AQK2yl+2SokgLyi8uqamBjItkJwNpumw3K3tI3brKvEWTqAnBLBdzYz32wqqxItoYva9rSZ9tilyITgYuDI8
+
+
+          cd /home/ec2-user
+          mkdir react-app
+          aws s3 cp s3://receipt-tracker-reactjs/S3-React-App /home/ec2-user/react-app/ --recursive
+          cd /home/ec2-user/react-app
+          npm install
+          npm start
+      Tags:
+        - Key: Name
+          Value: EC2-Formation
+
+  # EC2SecurityGroup
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 security group for frontend instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # SSM Parameter for API Gateway URL
+  ApiGatewayUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /ExpenseApp/ApiGatewayURL  
+      Type: String
+      Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+      Description: API Gateway URL for your React app
+
+# Outputs of the Project
+Outputs:
+  APIGatewayURL:
+    Description: "API Gateway URL"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Export:
+      Name: APIGatewayURL
+
+  EC2InstancePublicIP:
+    Description: "Public IP address of the EC2 instance"
+    Value: !GetAtt EC2Instance.PublicIp
+
+
+
+
