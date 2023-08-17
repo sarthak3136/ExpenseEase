@@ -28,5 +28,20 @@ The application uses the IP address of the EC2 instance provisioned from the Clo
 
 ### Contributing
 
-    1. Fork the repository
+Contributions are always welcome! Follow these steps to contribute:
+
+1. **Fork** the repository.
+2. Create a new branch:
+```bash
+git checkout -b new-feature
+```
+3. Make your changes and commit them:
+```bash
+git commit -m "Commit name"
+```
+4. Push to the new branch:
+```bash
+git push origin new-feature
+```
+5. Create a pull request on GitHub.
     
